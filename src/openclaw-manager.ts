@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 
@@ -17,9 +17,7 @@ import type {
   GlobalSkillsUpdateParams,
   GatewayRestartParams,
   LogsQueryParams,
-  ManagedAgentRecord,
-  OntologyCreateParams,
-  OntologyDeleteParams
+  ManagedAgentRecord
 } from "./types.js";
 
 const require = createRequire(import.meta.url);
@@ -71,6 +69,7 @@ function resolveBundledClawhubBin(): string {
 export class OpenClawManager {
   private readonly clawhubCli: CliRunner;
   private readonly clawhubBin: string;
+  private readonly scheduleContainerRestart?: (reason: string) => void;
 
   constructor(
     private readonly cli: CliRunner,
@@ -80,18 +79,42 @@ export class OpenClawManager {
     dependencies?: {
       clawhubCli?: CliRunner;
       clawhubBin?: string;
+      scheduleContainerRestart?: (reason: string) => void;
     }
   ) {
     this.clawhubCli = dependencies?.clawhubCli ?? new CliRunner(process.execPath);
     this.clawhubBin = dependencies?.clawhubBin ?? resolveBundledClawhubBin();
+    this.scheduleContainerRestart = dependencies?.scheduleContainerRestart;
   }
 
   async listAgents(): Promise<unknown> {
     const managedAgents = await this.stateStore.listAgents();
-    const configuredAgents = await this.safeJson<unknown>(["agents", "list", "--json", "--bindings"]);
+    const configuredAgents = await this.safeJson<Array<{
+      id?: string;
+      name?: string;
+      workspace?: string;
+      sandbox?: { mode?: string };
+      tools?: { exec?: { security?: string; ask?: string } };
+      bindings?: Array<{ bind?: string }>;
+    }>>(["agents", "list", "--json", "--bindings"]);
+    const byId = new Map(managedAgents.map((agent) => [agent.id, agent]));
+    const items = configuredAgents.map((agent) => {
+      const managed = agent.id ? byId.get(agent.id) : undefined;
+      return {
+        agentId: agent.id ?? "",
+        name: agent.name ?? agent.id ?? "",
+        workspace: managed?.workspace ?? agent.workspace ?? "",
+        workspaces: managed?.workspace ?? agent.workspace ?? "",
+        inboundTopic: managed?.inboundTopic,
+        "inbound-topic": managed?.inboundTopic,
+        outboundTopic: managed?.outboundTopic,
+        "outbound-topic": managed?.outboundTopic
+      };
+    });
     return {
       managedAgents,
-      configuredAgents
+      configuredAgents,
+      items
     };
   }
 
@@ -167,10 +190,6 @@ export class OpenClawManager {
     };
 
     await this.stateStore.upsertAgent(record);
-
-    if (params.restart ?? true) {
-      await this.restartGateway({ safe: true });
-    }
 
     return record;
   }
@@ -251,10 +270,6 @@ export class OpenClawManager {
 
     await this.stateStore.removeAgent(record.id);
 
-    if (params.restart ?? true) {
-      await this.restartGateway({ safe: true });
-    }
-
     return {
       agentId: record.id,
       accountId: record.accountId
@@ -293,63 +308,6 @@ export class OpenClawManager {
     const record = await this.requireManagedAgent(params.agentId);
     const targetPath = await this.writeAgentsMarkdown(record.workspace, params.content);
     return { path: targetPath };
-  }
-
-  async listOntologies(): Promise<{ items: string[] }> {
-    await mkdir(this.env.ontologyRoot, { recursive: true });
-    const { readdir } = await import("node:fs/promises");
-    const items = await readdir(this.env.ontologyRoot, { withFileTypes: true });
-    return {
-      items: items.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort()
-    };
-  }
-
-  async createOntology(params: OntologyCreateParams): Promise<{ path: string }> {
-    validateAgentId(params.name);
-
-    const targetDir = path.join(this.env.ontologyRoot, params.name);
-    if (params.replace) {
-      await rm(targetDir, { recursive: true, force: true });
-    }
-
-    const AdmZip = (await import("adm-zip")).default;
-    const zip = params.zipBase64
-      ? new AdmZip(Buffer.from(params.zipBase64, "base64"))
-      : params.zipFile
-        ? new AdmZip(params.zipFile)
-        : null;
-
-    if (!zip) {
-      throw new Error("ontology.create requires zipBase64 or zipFile");
-    }
-
-    await mkdir(targetDir, { recursive: true });
-
-    for (const entry of zip.getEntries()) {
-      const normalized = path.normalize(entry.entryName).replace(/^(\.\.(\/|\\|$))+/, "");
-      const destination = path.join(targetDir, normalized);
-      const relative = path.relative(targetDir, destination);
-      if (relative.startsWith("..") || path.isAbsolute(relative)) {
-        throw new Error(`Zip entry escapes ontology root: ${entry.entryName}`);
-      }
-
-      if (entry.isDirectory) {
-        await mkdir(destination, { recursive: true });
-        continue;
-      }
-
-      await mkdir(path.dirname(destination), { recursive: true });
-      await writeFile(destination, entry.getData());
-    }
-
-    return { path: targetDir };
-  }
-
-  async deleteOntology(params: OntologyDeleteParams): Promise<{ path: string }> {
-    validateAgentId(params.name);
-    const targetDir = path.join(this.env.ontologyRoot, params.name);
-    await rm(targetDir, { recursive: true, force: true });
-    return { path: targetDir };
   }
 
   async queryLogs(params: LogsQueryParams = {}): Promise<{ output: string }> {
@@ -517,6 +475,24 @@ export class OpenClawManager {
   }
 
   async restartGateway(params: GatewayRestartParams = {}): Promise<unknown> {
+    if (this.env.gatewayRestartMode === "none") {
+      return {
+        skipped: true,
+        mode: this.env.gatewayRestartMode,
+        reason: "Gateway restart is disabled by configuration"
+      };
+    }
+    if (this.env.gatewayRestartMode === "container") {
+      this.scheduleContainerRestart?.("gateway.restart");
+      return {
+        scheduled: true,
+        mode: this.env.gatewayRestartMode,
+        targetPid: 1,
+        signal: "SIGTERM",
+        reason: "Container restart scheduled"
+      };
+    }
+
     const args = ["gateway", "restart"];
     if (params.safe ?? (!params.force)) {
       args.push("--safe");

@@ -6,6 +6,7 @@ import { connect, type IClientOptions, type MqttClient } from "mqtt";
 import { CliRunner } from "./cli-runner.js";
 import { loadEnvironmentConfig } from "./env.js";
 import { OpenClawManager } from "./openclaw-manager.js";
+import { OntologyManager } from "./ontology-manager.js";
 import { ManagedStateStore } from "./state-store.js";
 import type {
   AgentCreateParams,
@@ -34,6 +35,83 @@ function sendJson(response: ServerResponse, statusCode: number, payload: unknown
   response.end(JSON.stringify(payload, null, 2));
 }
 
+interface MqttRuntimeState {
+  connected: boolean;
+  subscribed: boolean;
+  lastConnectedAt?: string;
+  lastSubscribedAt?: string;
+  lastDisconnectedAt?: string;
+  lastError?: string;
+  lastErrorAt?: string;
+}
+
+interface PendingContainerRestart {
+  reason: string;
+  requestedAt: string;
+}
+
+export function collectConfigIssues(env: ReturnType<typeof loadEnvironmentConfig>): string[] {
+  const issues: string[] = [];
+
+  if (!Number.isInteger(env.port) || env.port < 1 || env.port > 65535) {
+    issues.push(`http.port must be an integer between 1 and 65535, received ${env.port}`);
+  }
+  if (env.mqttRequestTopic === env.mqttResponseTopic) {
+    issues.push("mqtt.requestTopic and mqtt.responseTopic must be different");
+  }
+  if (env.inboundTopicTemplate === env.outboundTopicTemplate) {
+    issues.push("mqtt.inboundTopicTemplate and mqtt.outboundTopicTemplate must be different");
+  }
+
+  return issues;
+}
+
+export function buildHealthReport(
+  env: ReturnType<typeof loadEnvironmentConfig>,
+  mqttState: MqttRuntimeState,
+  configIssues: string[]
+) {
+  const configOk = configIssues.length === 0;
+  const managementMqttOk = mqttState.connected && mqttState.subscribed;
+  const ok = configOk && managementMqttOk;
+
+  return {
+    status: ok ? "ok" : "error",
+    service: SERVICE_NAME,
+    version: SERVICE_VERSION,
+    checks: {
+      config: {
+        ok: configOk,
+        issues: configIssues,
+        configFile: env.configFile,
+        openclawConfigPath: env.openclawConfigPath,
+        gatewayRestartMode: env.gatewayRestartMode
+      },
+      managementMqtt: {
+        ok: managementMqttOk,
+        connected: mqttState.connected,
+        subscribed: mqttState.subscribed,
+        brokerUrl: env.mqttBrokerUrl,
+        clientId: env.mqttClientId,
+        requestTopic: env.mqttRequestTopic,
+        responseTopic: env.mqttResponseTopic,
+        lastConnectedAt: mqttState.lastConnectedAt,
+        lastSubscribedAt: mqttState.lastSubscribedAt,
+        lastDisconnectedAt: mqttState.lastDisconnectedAt,
+        lastError: mqttState.lastError,
+        lastErrorAt: mqttState.lastErrorAt
+      },
+      managedMqttChannel: {
+        ok: true,
+        brokerUrl: env.managedMqttBrokerUrl,
+        hasUsername: env.managedMqttUsername.trim().length > 0,
+        inboundTopicTemplate: env.inboundTopicTemplate,
+        outboundTopicTemplate: env.outboundTopicTemplate
+      }
+    }
+  };
+}
+
 class TaskQueue {
   private tail = Promise.resolve();
 
@@ -46,10 +124,20 @@ class TaskQueue {
 
 export function createManagementConsoleService(_options: ServiceOptions = {}) {
   const env = loadEnvironmentConfig();
+  const configIssues = collectConfigIssues(env);
   const stateStore = new ManagedStateStore(env.stateFile);
   const cli = new CliRunner(env.openclawBin);
   const doctorCli = new CliRunner(env.doctorBin);
-  const manager = new OpenClawManager(cli, doctorCli, env, stateStore);
+  let pendingContainerRestart: PendingContainerRestart | undefined;
+  const manager = new OpenClawManager(cli, doctorCli, env, stateStore, {
+    scheduleContainerRestart: (reason: string) => {
+      pendingContainerRestart = {
+        reason,
+        requestedAt: new Date().toISOString()
+      };
+    }
+  });
+  const ontologyManager = new OntologyManager(env);
   const info: ServiceInfo = {
     name: SERVICE_NAME,
     version: SERVICE_VERSION,
@@ -58,24 +146,70 @@ export function createManagementConsoleService(_options: ServiceOptions = {}) {
   };
 
   let mqttClient: MqttClient | undefined;
-  let mqttConnected = false;
+  const mqttState: MqttRuntimeState = {
+    connected: false,
+    subscribed: false
+  };
   const queue = new TaskQueue();
+
+  function markMqttError(message: string): void {
+    mqttState.lastError = message;
+    mqttState.lastErrorAt = new Date().toISOString();
+  }
+
+  function takePendingContainerRestart(): PendingContainerRestart | undefined {
+    const pending = pendingContainerRestart;
+    pendingContainerRestart = undefined;
+    return pending;
+  }
+
+  function executeContainerRestart(restart: PendingContainerRestart): void {
+    const signal: NodeJS.Signals = "SIGTERM";
+    process.stderr.write(
+      `Scheduling container restart via PID 1 ${signal} (${restart.reason}, requested at ${restart.requestedAt})\n`
+    );
+    setImmediate(() => {
+      try {
+        process.kill(1, signal);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        process.stderr.write(`Failed to trigger container restart: ${message}\n`);
+      }
+    });
+  }
+
+  async function buildHealth() {
+    return buildHealthReport(env, mqttState, configIssues);
+  }
 
   async function buildStatus() {
     return {
       service: info.name,
       version: info.version,
       mqtt: {
-        connected: mqttConnected,
+        connected: mqttState.connected,
+        subscribed: mqttState.subscribed,
         brokerUrl: env.mqttBrokerUrl,
         requestTopic: env.mqttRequestTopic,
-        responseTopic: env.mqttResponseTopic
+        responseTopic: env.mqttResponseTopic,
+        clientId: env.mqttClientId,
+        lastConnectedAt: mqttState.lastConnectedAt,
+        lastSubscribedAt: mqttState.lastSubscribedAt,
+        lastDisconnectedAt: mqttState.lastDisconnectedAt,
+        lastError: mqttState.lastError,
+        lastErrorAt: mqttState.lastErrorAt
+      },
+      config: {
+        valid: configIssues.length === 0,
+        issues: configIssues
       },
       configFile: env.configFile,
+      gatewayRestartMode: env.gatewayRestartMode,
       openclawHome: env.openclawHome,
       openclawStateDir: env.openclawStateDir,
       openclawConfigPath: env.openclawConfigPath,
       globalSkillsRoot: env.globalSkillsRoot,
+      health: await buildHealth(),
       managedAgents: await stateStore.listAgents()
     };
   }
@@ -113,11 +247,11 @@ export function createManagementConsoleService(_options: ServiceOptions = {}) {
       case "skills.global.delete":
         return await manager.deleteGlobalSkill(params as GlobalSkillsDeleteParams);
       case "ontology.list":
-        return await manager.listOntologies();
+        return await ontologyManager.listOntologies();
       case "ontology.create":
-        return await manager.createOntology(params as OntologyCreateParams);
+        return await ontologyManager.createOntology(params as OntologyCreateParams);
       case "ontology.delete":
-        return await manager.deleteOntology(params as OntologyDeleteParams);
+        return await ontologyManager.deleteOntology(params as OntologyDeleteParams);
       case "logs.query":
         return await manager.queryLogs(params as LogsQueryParams);
       case "diagnostics.run":
@@ -201,23 +335,28 @@ export function createManagementConsoleService(_options: ServiceOptions = {}) {
       }
     });
 
-    await publishResponse(request, payload);
+    let publishError: unknown;
+    try {
+      await publishResponse(request, payload);
+    } catch (error: unknown) {
+      publishError = error;
+    }
+
+    const pendingRestart = takePendingContainerRestart();
+    if (pendingRestart) {
+      executeContainerRestart(pendingRestart);
+    }
+
+    if (publishError) {
+      throw publishError;
+    }
   }
 
   function routeHttp(request: IncomingMessage, response: ServerResponse): void {
     void (async () => {
       if (request.method === "GET" && request.url === "/health") {
-        sendJson(response, 200, { status: "ok" });
-        return;
-      }
-
-      if (request.method === "GET" && request.url === "/ready") {
-        sendJson(response, mqttConnected ? 200 : 503, { ready: mqttConnected });
-        return;
-      }
-
-      if (request.method === "GET" && request.url === "/state") {
-        sendJson(response, 200, await buildStatus());
+        const health = await buildHealth();
+        sendJson(response, health.status === "ok" ? 200 : 503, health);
         return;
       }
 
@@ -245,21 +384,34 @@ export function createManagementConsoleService(_options: ServiceOptions = {}) {
 
       mqttClient = connect(env.mqttBrokerUrl, mqttOptions);
       mqttClient.on("connect", () => {
-        mqttConnected = true;
+        mqttState.connected = true;
+        mqttState.subscribed = false;
+        mqttState.lastConnectedAt = new Date().toISOString();
         mqttClient?.subscribe(env.mqttRequestTopic, { qos: 1 }, (error: Error | null) => {
           if (error) {
-            process.stderr.write(`Failed to subscribe to ${env.mqttRequestTopic}: ${error.message}\n`);
+            const message = `Failed to subscribe to ${env.mqttRequestTopic}: ${error.message}`;
+            markMqttError(message);
+            process.stderr.write(`${message}\n`);
+            return;
           }
+
+          mqttState.subscribed = true;
+          mqttState.lastSubscribedAt = new Date().toISOString();
         });
       });
       mqttClient.on("reconnect", () => {
-        mqttConnected = false;
+        mqttState.connected = false;
+        mqttState.subscribed = false;
       });
       mqttClient.on("close", () => {
-        mqttConnected = false;
+        mqttState.connected = false;
+        mqttState.subscribed = false;
+        mqttState.lastDisconnectedAt = new Date().toISOString();
       });
       mqttClient.on("error", (error: Error) => {
-        process.stderr.write(`MQTT error: ${error.message}\n`);
+        const message = `MQTT error: ${error.message}`;
+        markMqttError(message);
+        process.stderr.write(`${message}\n`);
       });
       mqttClient.on("message", (_topic: string, message: Buffer) => {
         void handleMqttMessage(message).catch((error: unknown) => {

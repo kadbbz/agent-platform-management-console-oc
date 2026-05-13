@@ -3,6 +3,7 @@ export { loadEnvironmentConfig, renderTopic } from "./env.js";
 export { CliRunner, CommandError } from "./cli-runner.js";
 export { ManagedStateStore } from "./state-store.js";
 export { OpenClawManager } from "./openclaw-manager.js";
+export { OntologyManager } from "./ontology-manager.js";
 export type {
   AgentCreateParams,
   AgentDocsUpdateParams,

@@ -14,6 +14,7 @@ export interface EnvironmentConfig {
   configFile: string;
   host: string;
   port: number;
+  gatewayRestartMode: "openclaw" | "none" | "container";
   openclawHome: string;
   openclawStateDir: string;
   openclawConfigPath: string;
@@ -21,6 +22,11 @@ export interface EnvironmentConfig {
   doctorBin: string;
   workspacesRoot: string;
   ontologyRoot: string;
+  ontologyS3Endpoint?: string;
+  ontologyS3Region: string;
+  ontologyS3AccessKeyId?: string;
+  ontologyS3SecretAccessKey?: string;
+  ontologyS3ForcePathStyle: boolean;
   globalSkillsRoot: string;
   stateFile: string;
   mqttBrokerUrl: string;
@@ -105,8 +111,8 @@ export interface AgentDocsUpdateParams {
 
 export interface OntologyCreateParams {
   name: string;
-  zipBase64?: string;
-  zipFile?: string;
+  bucket: string;
+  objectKey: string;
   replace?: boolean;
 }
 

@@ -126,6 +126,9 @@ Example:
     "host": "0.0.0.0",
     "port": 3000
   },
+  "gateway": {
+    "restartMode": "openclaw"
+  },
   "openclaw": {
     "bin": "openclaw",
     "doctorBin": "doctor",
@@ -147,12 +150,12 @@ Example:
 
 Secrets stay in env:
 
-- `OC_MANAGEMENT_MQTT_BROKER`
-- `OC_MANAGEMENT_MQTT_USERNAME`
-- `OC_MANAGEMENT_MQTT_PASSWORD`
-- `OC_MQTT_CHANNEL_BROKER`
-- `OC_MQTT_CHANNEL_USERNAME`
-- `OC_MQTT_CHANNEL_PASSWORD`
+- `AIOS_MQTT_BROKER`
+- `AIOS_MQTT_USERNAME`
+- `AIOS_MQTT_PASSWORD`
+- `AIOS_MQTT_CHANNEL_BROKER`
+- `AIOS_MQTT_CHANNEL_USERNAME`
+- `AIOS_MQTT_CHANNEL_PASSWORD`
 - `OPENCLAW_HOME`
 - `OPENCLAW_STATE_DIR`
 - `OPENCLAW_CONFIG_PATH`
@@ -283,17 +286,21 @@ Implementation:
 
 - default to `openclaw gateway restart --safe --json`
 - allow `skipDeferral` and `force`
+- allow disabling restart entirely with `gateway.restartMode = "none"` for containerized deployments where the gateway process is not restartable through the CLI
+- allow container restart with `gateway.restartMode = "container"` by signaling PID 1 and relying on Docker restart policy
 
 ## Restart policy
 
-Different actions have different restart defaults:
+Only the explicit `gateway.restart` action triggers a restart.
 
-- create: restart by default
-- delete: restart by default
-- enable/disable: no restart by default
-- model/docs update: no restart by default
+- `agent.create`, `agent.delete`, `agent.enable`, `agent.disable`
+- `agent.model.set`, `agent.docs.update`
+- `skills.global.*`
+- `ontology.*`
+- `logs.query`
+- `diagnostics.run`
 
-This keeps management responsive while still protecting the high-risk topology-changing operations.
+All of the actions above only change configuration or query state. They do not restart the gateway automatically.
 
 ## Non-goals for v1
 
