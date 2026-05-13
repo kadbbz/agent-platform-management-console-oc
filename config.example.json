@@ -1,0 +1,22 @@
+{
+  "http": {
+    "host": "0.0.0.0",
+    "port": 3000
+  },
+  "openclaw": {
+    "bin": "openclaw",
+    "doctorBin": "doctor",
+    "workspacesRoot": "/var/platform_data/openclaw/workspaces",
+    "ontologyRoot": "/var/platform_data/ontology"
+  },
+  "mqtt": {
+    "requestTopic": "openclaw/management/request",
+    "responseTopic": "openclaw/management/response",
+    "inboundTopicTemplate": "agents/channel/{agent-name}/inbound",
+    "outboundTopicTemplate": "agents/channel/{agent-name}/outbound"
+  },
+  "skills": {
+    "globalRoot": ""
+  },
+  "stateFile": "/var/platform_data/openclaw-management/managed-agents.json"
+}
